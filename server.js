@@ -4,13 +4,37 @@ console.log('DB_USER:', process.env.DB_USER);
 console.log('DB_PASSWORD:', process.env.DB_PASSWORD ? '[SET]' : '[NOT SET]');
 
 const express = require('express');
+const cors = require('cors'); // ✅ Import CORS
 const mysql = require('mysql2');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer'); // Added for email
 
+// --- Import Google OAuth packages ---
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const session = require('express-session');
+
 const app = express();
+
+// ✅ Enable CORS
+app.use(cors({
+  origin: 'http://localhost:3000', // Change this to your frontend URL/port if needed (e.g., http://localhost:5173 for Vite)
+  credentials: true
+}));
+
 app.use(express.json()); // Parse JSON in request body
+
+// --- Setup express-session (needed for Passport) ---
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'some-strong-secret',
+  resave: false,
+  saveUninitialized: false
+}));
+
+// --- Initialize passport and session ---
+app.use(passport.initialize());
+app.use(passport.session());
 
 // MySQL Connection
 const db = mysql.createConnection({
@@ -40,6 +64,74 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASS      // App password
   }
 });
+
+// ----------------------
+// Passport Google Strategy setup
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: "/api/auth/google/callback"
+  },
+  async (accessToken, refreshToken, profile, done) => {
+    // Implement findOrCreate logic here:
+    // Assumes you have a `google_id` column in your users table (VARCHAR)
+
+    db.query(
+      'SELECT * FROM users WHERE google_id = ?',
+      [profile.id],
+      (err, results) => {
+        if (err) return done(err);
+
+        if (results.length > 0) {
+          return done(null, results[0]);
+        } else {
+          // Insert new user with google_id, username from profile.displayName, and email
+          db.query(
+            'INSERT INTO users (username, email, google_id) VALUES (?, ?, ?)',
+            [profile.displayName || '', profile.emails[0].value, profile.id],
+            (insertErr, insertResult) => {
+              if (insertErr) return done(insertErr);
+
+              db.query(
+                'SELECT * FROM users WHERE id = ?',
+                [insertResult.insertId],
+                (err2, newResults) => {
+                  if (err2) return done(err2);
+                  return done(null, newResults[0]);
+                }
+              );
+            }
+          );
+        }
+      }
+    );
+  }
+));
+
+passport.serializeUser((user, done) => {
+  done(null, user.id);
+});
+
+passport.deserializeUser((id, done) => {
+  db.query('SELECT * FROM users WHERE id = ?', [id], (err, results) => {
+    if (err) return done(err, null);
+    done(null, results[0]);
+  });
+});
+
+// ----------------------
+// OAuth routes:
+app.get('/api/auth/google',
+  passport.authenticate('google', { scope: ['profile', 'email'] })
+);
+
+app.get('/api/auth/google/callback',
+  passport.authenticate('google', { failureRedirect: '/login', session: true }),
+  (req, res) => {
+    // Successful authentication, redirect or respond as needed
+    res.redirect('http://localhost:3000/'); // Or send token/user info JSON for SPA apps if preferred
+  }
+);
 
 // ------------------ API Routes ------------------ //
 
@@ -94,8 +186,8 @@ app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
 
   db.query(
-    'SELECT * FROM users WHERE username = ?',
-    [username],
+    'SELECT * FROM users WHERE username = ? OR email = ?',
+    [username, username], // Pass both for lookup by username or email
     async (err, results) => {
       if (err || results.length === 0) {
         return res.status(401).json({ error: 'Invalid credentials' });
